@@ -1,4 +1,4 @@
-use std::{sync::Arc, sync::RwLock, time::Instant};
+use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}, sync::RwLock};
 
 use colored::*;
 use drillx::{
@@ -59,11 +59,11 @@ impl Miner {
             last_balance = proof.balance;
 
             // Calculate cutoff time
-            let cutoff_time = self.get_cutoff(proof, args.buffer_time).await;
+            // let cutoff_time = self.get_cutoff(proof, args.buffer_time).await;
 
             // Run drillx
             let solution =
-                Self::find_hash_par(proof, cutoff_time, args.cores, config.min_difficulty as u32)
+                Self::find_hash_par(proof, args.cores, args.min_difficulty)
                     .await;
 
             // Build instruction set
@@ -91,24 +91,32 @@ impl Miner {
 
     async fn find_hash_par(
         proof: Proof,
-        cutoff_time: u64,
         cores: u64,
         min_difficulty: u32,
     ) -> Solution {
+        let stop_flag = Arc::new(AtomicBool::new(false));
         // Dispatch job to each thread
         let progress_bar = Arc::new(spinner::new_progress_bar());
-        let global_best_difficulty = Arc::new(RwLock::new(0u32));
+
         progress_bar.set_message("Mining...");
+
         let core_ids = core_affinity::get_core_ids().unwrap();
+
         let handles: Vec<_> = core_ids
             .into_iter()
             .map(|i| {
-                let global_best_difficulty = Arc::clone(&global_best_difficulty);
+                let proof = proof.clone();
+                let progress_bar = progress_bar.clone();
+                let stop_flag = stop_flag.clone();
+
                 std::thread::spawn({
-                    let proof = proof.clone();
-                    let progress_bar = progress_bar.clone();
-                    let mut memory = equix::SolverMemory::new();
                     move || {
+                        let mut nonce = u64::MAX.saturating_div(cores).saturating_mul(i.id as u64);
+                        let mut best_nonce = nonce;
+                        let mut best_difficulty = 0;
+                        let mut best_hash = Hash::default();
+                        let mut memory = equix::SolverMemory::new();
+
                         // Return if core should not be used
                         if (i.id as u64).ge(&cores) {
                             return (0, 0, Hash::default());
@@ -117,13 +125,10 @@ impl Miner {
                         // Pin to core
                         let _ = core_affinity::set_for_current(i);
 
-                        // Start hashing
-                        let timer = Instant::now();
-                        let mut nonce = u64::MAX.saturating_div(cores).saturating_mul(i.id as u64);
-                        let mut best_nonce = nonce;
-                        let mut best_difficulty = 0;
-                        let mut best_hash = Hash::default();
                         loop {
+                            if stop_flag.load(Ordering::Relaxed) {
+                                break;
+                            }
                             // Create hash
                             if let Ok(hx) = drillx::hash_with_memory(
                                 &mut memory,
@@ -131,47 +136,26 @@ impl Miner {
                                 &nonce.to_le_bytes(),
                             ) {
                                 let difficulty = hx.difficulty();
+
                                 if difficulty.gt(&best_difficulty) {
                                     best_nonce = nonce;
                                     best_difficulty = difficulty;
                                     best_hash = hx;
-                                    // {{ edit_1 }}
-                                    if best_difficulty.gt(&*global_best_difficulty.read().unwrap())
-                                    {
-                                        *global_best_difficulty.write().unwrap() = best_difficulty;
-                                    }
-                                    // {{ edit_1 }}
+                                }
+
+                                progress_bar.set_message(format!(
+                                    "MIN_DIFFICULTY: {} > {} Mining...",
+                                    min_difficulty,
+                                    best_difficulty
+                                ));
+
+                                // Exit loop if difficulty meets or exceeds min_difficulty
+                                if best_difficulty.ge(&min_difficulty) {
+                                    stop_flag.store(true, Ordering::Relaxed);
+                                    break;
                                 }
                             }
 
-                            // Exit if time has elapsed
-                            if nonce % 100 == 0 {
-                                let global_best_difficulty =
-                                    *global_best_difficulty.read().unwrap();
-                                if timer.elapsed().as_secs().ge(&cutoff_time) {
-                                    if i.id == 0 {
-                                        progress_bar.set_message(format!(
-                                            "Mining... (difficulty {})",
-                                            global_best_difficulty,
-                                        ));
-                                    }
-                                    if global_best_difficulty.ge(&min_difficulty) {
-                                        // Mine until min difficulty has been met
-                                        break;
-                                    }
-                                } else if i.id == 0 {
-                                    progress_bar.set_message(format!(
-                                        "Mining... (difficulty {}, time {})",
-                                        global_best_difficulty,
-                                        format_duration(
-                                            cutoff_time.saturating_sub(timer.elapsed().as_secs())
-                                                as u32
-                                        ),
-                                    ));
-                                }
-                            }
-
-                            // Increment nonce
                             nonce += 1;
                         }
 
@@ -226,15 +210,15 @@ impl Miner {
             .le(&clock.unix_timestamp)
     }
 
-    async fn get_cutoff(&self, proof: Proof, buffer_time: u64) -> u64 {
-        let clock = get_clock(&self.rpc_client).await;
-        proof
-            .last_hash_at
-            .saturating_add(60)
-            .saturating_sub(buffer_time as i64)
-            .saturating_sub(clock.unix_timestamp)
-            .max(0) as u64
-    }
+    // async fn get_cutoff(&self, proof: Proof, buffer_time: u64) -> u64 {
+    //     let clock = get_clock(&self.rpc_client).await;
+    //     proof
+    //         .last_hash_at
+    //         .saturating_add(60)
+    //         .saturating_sub(buffer_time as i64)
+    //         .saturating_sub(clock.unix_timestamp)
+    //         .max(0) as u64
+    // }
 
     async fn find_bus(&self) -> Pubkey {
         // Fetch the bus with the largest balance
@@ -264,8 +248,8 @@ fn calculate_multiplier(balance: u64, top_balance: u64) -> f64 {
     1.0 + (balance as f64 / top_balance as f64).min(1.0f64)
 }
 
-fn format_duration(seconds: u32) -> String {
-    let minutes = seconds / 60;
-    let remaining_seconds = seconds % 60;
-    format!("{:02}:{:02}", minutes, remaining_seconds)
-}
+// fn format_duration(seconds: u32) -> String {
+//     let minutes = seconds / 60;
+//     let remaining_seconds = seconds % 60;
+//     format!("{:02}:{:02}", minutes, remaining_seconds)
+// }

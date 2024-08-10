@@ -1,14 +1,15 @@
-use std::time::Duration;
+use std::{time::Duration, str::FromStr};
 
 use chrono::Local;
 use colored::*;
+use rand::seq::SliceRandom;
 use solana_client::{
     client_error::{ClientError, ClientErrorKind, Result as ClientResult},
     rpc_config::RpcSendTransactionConfig,
 };
 use solana_program::{
     instruction::Instruction,
-    native_token::{lamports_to_sol, sol_to_lamports},
+    native_token::{lamports_to_sol, sol_to_lamports}, system_instruction::transfer, pubkey::Pubkey,
 };
 use solana_rpc_client::spinner;
 use solana_sdk::{
@@ -28,7 +29,7 @@ const _SIMULATION_RETRIES: usize = 4;
 const GATEWAY_RETRIES: usize = 150;
 const CONFIRM_RETRIES: usize = 8;
 
-const CONFIRM_DELAY: u64 = 500;
+const CONFIRM_DELAY: u64 = 5;
 const GATEWAY_DELAY: u64 = 0; //300;
 
 pub enum ComputeBudget {
@@ -41,11 +42,19 @@ impl Miner {
         &self,
         ixs: &[Instruction],
         compute_budget: ComputeBudget,
-        skip_confirm: bool,
+        skip_confirm: bool
     ) -> ClientResult<Signature> {
         let signer = self.signer();
         let client = self.rpc_client.clone();
         let fee_payer = self.fee_payer();
+        let mut send_client = self.rpc_client.clone();
+
+
+        let current_tip = *self.tip.read().unwrap();
+
+        if current_tip > 0 {
+            send_client = self.jito_client.clone();
+        }
 
         // Return error, if balance is zero
         self.check_balance().await;
@@ -70,6 +79,29 @@ impl Miner {
         // Add in user instructions
         final_ixs.extend_from_slice(ixs);
 
+        if current_tip > 0 {
+            let tips = [
+                "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+                "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+                "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+                "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+                "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+                "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+                "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+                "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+            ];
+
+            final_ixs.push(
+                transfer(
+                    &signer.pubkey(),
+                    &Pubkey::from_str(
+                        &tips.choose(&mut rand::thread_rng()).unwrap().to_string()
+                    ).unwrap(),
+                    current_tip
+                )
+            );
+        }
+
         // Build tx
         let send_cfg = RpcSendTransactionConfig {
             skip_preflight: true,
@@ -83,40 +115,29 @@ impl Miner {
         // Submit tx
         let progress_bar = spinner::new_progress_bar();
         let mut attempts = 0;
+        let mut fee = self.priority_fee.unwrap_or(0);
         loop {
             progress_bar.set_message(format!("Submitting transaction... (attempt {})", attempts,));
 
             // Sign tx with a new blockhash (after approximately ~45 sec)
-            if attempts % 10 == 0 {
+            if attempts % 5 == 0 {
                 // Reset the compute unit price
-                if self.dynamic_fee {
-                    let fee = match self.dynamic_fee().await {
-                        Ok(fee) => {
-                            progress_bar.println(format!("  Priority fee: {} microlamports", fee));
-                            fee
-                        }
-                        Err(err) => {
-                            let fee = self.priority_fee.unwrap_or(0);
-                            progress_bar.println(format!(
-                                "  {} {} Falling back to static value: {} microlamports",
-                                "WARNING".bold().yellow(),
-                                err,
-                                fee
-                            ));
-                            fee
-                        }
-                    };
+                fee += 500;
 
-                    final_ixs.remove(1);
-                    final_ixs.insert(1, ComputeBudgetInstruction::set_compute_unit_price(fee));
-                    tx = Transaction::new_with_payer(&final_ixs, Some(&fee_payer.pubkey()));
-                }
+                progress_bar.println(
+                    format!("  Priority fee: {} microlamports", self.priority_fee.unwrap_or(0))
+                );
+
+                final_ixs.remove(1);
+                final_ixs.insert(1, ComputeBudgetInstruction::set_compute_unit_price(
+                    fee as u64
+                ));
+                tx = Transaction::new_with_payer(&final_ixs, Some(&fee_payer.pubkey()));
 
                 // Resign the tx
                 let (hash, _slot) = client
                     .get_latest_blockhash_with_commitment(self.rpc_client.commitment())
-                    .await
-                    .unwrap();
+                    .await?;
                 if signer.pubkey() == fee_payer.pubkey() {
                     tx.sign(&[&signer], hash);
                 } else {
@@ -125,7 +146,7 @@ impl Miner {
             }
 
             // Send transaction
-            match client.send_transaction_with_config(&tx, send_cfg).await {
+            match send_client.send_transaction_with_config(&tx, send_cfg).await {
                 Ok(sig) => {
                     // Skip confirmation
                     if skip_confirm {
