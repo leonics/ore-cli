@@ -26,11 +26,11 @@ const MIN_SOL_BALANCE: f64 = 0.005;
 
 const RPC_RETRIES: usize = 0;
 const _SIMULATION_RETRIES: usize = 4;
-const GATEWAY_RETRIES: usize = 150;
-const CONFIRM_RETRIES: usize = 8;
+const GATEWAY_RETRIES: usize = 50;
+const CONFIRM_RETRIES: usize = 10;
 
-const CONFIRM_DELAY: u64 = 5;
-const GATEWAY_DELAY: u64 = 0; //300;
+const CONFIRM_DELAY: u64 = 500;
+const GATEWAY_DELAY: u64 = 300; //300;
 
 pub enum ComputeBudget {
     Dynamic,
@@ -120,12 +120,14 @@ impl Miner {
             progress_bar.set_message(format!("Submitting transaction... (attempt {})", attempts,));
 
             // Sign tx with a new blockhash (after approximately ~45 sec)
-            if attempts % 5 == 0 {
+            if attempts % 2 == 0 {
                 // Reset the compute unit price
-                fee += 500;
+                if attempts > 0 {
+                    fee += 1;
+                }
 
                 progress_bar.println(
-                    format!("  Priority fee: {} microlamports", self.priority_fee.unwrap_or(0))
+                    format!("  Priority fee: {} microlamports", fee)
                 );
 
                 final_ixs.remove(1);
@@ -153,6 +155,10 @@ impl Miner {
                         progress_bar.finish_with_message(format!("Sent: {}", sig));
                         return Ok(sig);
                     }
+
+                    progress_bar.println(
+                        format!("  Transaction get status...: {}", sig)
+                    );
 
                     // Confirm transaction
                     for _ in 0..CONFIRM_RETRIES {
