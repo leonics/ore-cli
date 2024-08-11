@@ -222,6 +222,7 @@ impl Miner {
                         "ERROR".bold().red(),
                         err.kind().to_string()
                     ));
+                    break Ok(Default::default());
                 }
             }
 
